@@ -34,7 +34,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================
 # الإعدادات
 # =========================
-FACTORY_TOKEN = "8324058809:AAF12vpKz2XRrIRUJ3vBCYZSuJGALv8Jm3g"
+FACTORY_TOKEN = "8987588644:AAFWJ7Cd62SljgXa5G5KvI18ACjQePbAA1o"
 OWNER_ID = 342845021  # ضع هنا ID حسابك في Telegram
 
 DB_PATH = Path(__file__).with_name("publishing_factory.db")
