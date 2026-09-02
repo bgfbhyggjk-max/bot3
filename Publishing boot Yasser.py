@@ -34,8 +34,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================
 # الإعدادات
 # =========================
-FACTORY_TOKEN = "PUT_FACTORY_BOT_TOKEN_HERE"
-OWNER_ID = 0  # ضع هنا ID حسابك في Telegram
+FACTORY_TOKEN = "8324058809:AAF12vpKz2XRrIRUJ3vBCYZSuJGALv8Jm3g"
+OWNER_ID = 342845021  # ضع هنا ID حسابك في Telegram
 
 DB_PATH = Path(__file__).with_name("publishing_factory.db")
 MAX_BROADCAST_DELAY = 86400
