@@ -234,8 +234,15 @@ async def register_chat(bot_db_id: int, chat_id: int, chat_type: str, title: str
         (bot_db_id, chat_id, chat_type, title, "active", await now()),
     )
 
+async def safe_send_message(bot: Bot, chat_id: int, text: str):
+    try:
+        await bot.send_message(chat_id, text)
+    except Exception as exc:
+        log.warning("فشل الإرسال للمحادثة %s: %s", chat_id, exc)
+
 async def send_saved_messages(bot_db_id: int):
     while True:
+        await asyncio.sleep(1)
         bot_row = await db_execute("SELECT token, status FROM bots WHERE id=?", (bot_db_id,), fetchone=True)
         if not bot_row or bot_row[1] != "active":
             return
@@ -257,10 +264,7 @@ async def send_saved_messages(bot_db_id: int):
 
         for _, text, delay in msgs:
             for (chat_id,) in chats:
-                try:
-                    await bot.send_message(chat_id, text)
-                except Exception as exc:
-                    log.warning("فشل الإرسال للجروب %s عبر البوت %s: %s", chat_id, bot_db_id, exc)
+                asyncio.create_task(safe_send_message(bot, chat_id, text))
 
             delay = max(MIN_BROADCAST_DELAY, min(int(delay), MAX_BROADCAST_DELAY))
             await asyncio.sleep(delay)
@@ -314,6 +318,7 @@ async def bot_startup(bot_db_id: int, token: str):
 
     @local_router.callback_query(F.data == "check_sub")
     async def check_sub_callback(call: CallbackQuery):
+        await call.answer()
         is_subbed = await check_subscription(bot, call.from_user.id)
         if is_subbed:
             await call.message.delete()
@@ -324,29 +329,29 @@ async def bot_startup(bot_db_id: int, token: str):
 
     @local_router.callback_query(F.data == "sub_main_menu")
     async def sub_main_menu(call: CallbackQuery):
+        await call.answer()
         if not await is_bot_owner(call.from_user.id):
             return
         text = "👋 <b>لوحة التحكم</b>\n\nاختر من القائمة:"
         await call.message.edit_text(text, reply_markup=sub_bot_main_menu(), parse_mode="HTML")
-        await call.answer()
 
     @local_router.callback_query(F.data == "sub_auto_publish")
     async def sub_auto_publish(call: CallbackQuery):
+        await call.answer()
         if not await is_bot_owner(call.from_user.id):
             return
         msgs = await db_execute("SELECT COUNT(*) FROM messages WHERE bot_id=?", (bot_db_id,), fetchone=True)
         count = msgs[0] if msgs else 0
         text = f"🔄 <b>النشر التلقائي</b>\n\nعدد المنشورات: {count}"
         await call.message.edit_text(text, reply_markup=sub_bot_auto_publish_menu(count), parse_mode="HTML")
-        await call.answer()
 
     @local_router.callback_query(F.data == "sub_create_post")
     async def sub_create_post(call: CallbackQuery, state: FSMContext):
+        await call.answer()
         if not await is_bot_owner(call.from_user.id):
             return
         await state.set_state(SubAddPostState.text)
         await call.message.edit_text("📝 أرسل الآن نص المنشور الذي تريد نشره تلقائياً:")
-        await call.answer()
 
     @local_router.message(SubAddPostState.text)
     async def sub_save_post_text(message: Message, state: FSMContext):
@@ -374,6 +379,7 @@ async def bot_startup(bot_db_id: int, token: str):
 
     @local_router.callback_query(F.data == "sub_list_posts")
     async def sub_list_posts(call: CallbackQuery):
+        await call.answer()
         if not await is_bot_owner(call.from_user.id):
             return
         rows = await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
@@ -388,7 +394,6 @@ async def bot_startup(bot_db_id: int, token: str):
         b = InlineKeyboardBuilder()
         b.button(text="🔙 رجوع", callback_data="sub_auto_publish")
         await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
-        await call.answer()
 
     @local_router.message()
     async def made_message(message: Message):
@@ -424,20 +429,21 @@ async def start(message: Message):
 
 @router.callback_query(F.data == "home")
 async def home(call: CallbackQuery, state: FSMContext):
+    await call.answer()
     await state.clear()
     if not await is_admin(call.from_user.id):
         return
     await call.message.edit_text("🏭 <b>لوحة تحكم مصنع البوتات</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
-    await call.answer()
 
 @router.callback_query(F.data == "cancel")
 async def cancel(call: CallbackQuery, state: FSMContext):
+    await call.answer()
     await state.clear()
     await call.message.edit_text("تم الإلغاء.", reply_markup=admin_keyboard())
-    await call.answer()
 
 @router.callback_query(F.data == "global_force_sub_menu")
 async def global_force_sub_menu(call: CallbackQuery, state: FSMContext):
+    await call.answer()
     if not await is_admin(call.from_user.id):
         return
     curr_chan = await get_force_channel()
@@ -449,7 +455,6 @@ async def global_force_sub_menu(call: CallbackQuery, state: FSMContext):
         "أو أرسل <b>إلغاء</b> لحذف الاشتراك الإجباري."
     )
     await call.message.edit_text(text, reply_markup=cancel_keyboard(), parse_mode="HTML")
-    await call.answer()
 
 @router.message(ForceSubState.channel)
 async def save_force_sub(message: Message, state: FSMContext):
@@ -472,6 +477,7 @@ async def save_force_sub(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "global_welcome_menu")
 async def global_welcome_menu(call: CallbackQuery, state: FSMContext):
+    await call.answer()
     if not await is_admin(call.from_user.id):
         return
     current_welcome = await get_global_welcome()
@@ -483,7 +489,6 @@ async def global_welcome_menu(call: CallbackQuery, state: FSMContext):
         "✏️ أرسل نص الترحيب الجديد الذي تريده أن يظهر للجميع عند الضغط على /start:"
     )
     await call.message.edit_text(text, reply_markup=cancel_keyboard(), parse_mode="HTML")
-    await call.answer()
 
 @router.message(GlobalWelcomeState.text)
 async def global_welcome_save(message: Message, state: FSMContext):
@@ -499,12 +504,12 @@ async def global_welcome_save(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "add_admin")
 async def add_admin(call: CallbackQuery, state: FSMContext):
+    await call.answer()
     if call.from_user.id != OWNER_ID:
         await call.answer("المالك الرئيسي فقط يضيف أدمن.", show_alert=True)
         return
     await state.set_state(AddAdmin.user_id)
     await call.message.edit_text("👤 أرسل ID الأدمن الجديد:", reply_markup=cancel_keyboard())
-    await call.answer()
 
 @router.message(AddAdmin.user_id)
 async def add_admin_id(message: Message, state: FSMContext):
@@ -519,11 +524,11 @@ async def add_admin_id(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "add_bot")
 async def add_bot(call: CallbackQuery, state: FSMContext):
+    await call.answer()
     if not await is_admin(call.from_user.id):
         return
     await state.set_state(AddBot.token)
     await call.message.edit_text("🤖 أرسل Token البوت الجديد:", reply_markup=cancel_keyboard())
-    await call.answer()
 
 @router.message(AddBot.token)
 async def add_bot_token(message: Message, state: FSMContext):
@@ -564,15 +569,16 @@ async def add_bot_owner(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "list_bots")
 async def list_bots(call: CallbackQuery):
+    await call.answer()
     rows = await db_execute("SELECT id, username, owner_id, status FROM bots ORDER BY id DESC", fetch=True)
     if not rows:
         await call.message.edit_text("لا توجد بوتات مضافة.", reply_markup=admin_keyboard())
     else:
         await call.message.edit_text("🤖 <b>قائمة البوتات المصنوعة:</b>", reply_markup=bots_keyboard(rows), parse_mode="HTML")
-    await call.answer()
 
 @router.callback_query(F.data.startswith("botinfo:"))
 async def bot_info(call: CallbackQuery):
+    await call.answer()
     bot_db_id = int(call.data.split(":")[1])
     row = await db_execute("SELECT username, owner_id, status, created_at FROM bots WHERE id=?", (bot_db_id,), fetchone=True)
     if not row:
@@ -596,10 +602,10 @@ async def bot_info(call: CallbackQuery):
         f"🕒 التاريخ: {created_at}"
     )
     await call.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
-    await call.answer()
 
 @router.callback_query(F.data.startswith("deletebot:"))
 async def delete_bot(call: CallbackQuery):
+    await call.answer("تم حذف البوت.")
     bot_db_id = int(call.data.split(":")[1])
     task = running_tasks.get(bot_db_id)
     if task and not task.done():
@@ -611,21 +617,21 @@ async def delete_bot(call: CallbackQuery):
         except Exception:
             pass
     await db_execute("DELETE FROM bots WHERE id=?", (bot_db_id,))
-    await call.answer("تم حذف البوت.")
     await list_bots(call)
 
 @router.callback_query(F.data == "messages_menu")
 async def messages_menu(call: CallbackQuery):
+    await call.answer()
     b = InlineKeyboardBuilder()
     b.button(text="➕ إضافة رسالة نشر بفاصل زمني", callback_data="add_message_select")
     b.button(text="📋 قائمة الرسائل المضافة", callback_data="saved_messages_select")
     b.button(text="⬅️ رجوع", callback_data="home")
     b.adjust(1)
     await call.message.edit_text("📤 <b>إدارة النشر التلقائي</b>", reply_markup=b.as_markup(), parse_mode="HTML")
-    await call.answer()
 
 @router.callback_query(F.data == "add_message_select")
 async def add_message_select(call: CallbackQuery):
+    await call.answer()
     rows = await db_execute("SELECT id, username FROM bots WHERE status='active' ORDER BY id DESC", fetch=True)
     b = InlineKeyboardBuilder()
     for bot_id, username in rows:
@@ -633,15 +639,14 @@ async def add_message_select(call: CallbackQuery):
     b.button(text="⬅️ رجوع", callback_data="messages_menu")
     b.adjust(1)
     await call.message.edit_text("اختر البوت لتسجيل رسالة جديدة له:", reply_markup=b.as_markup())
-    await call.answer()
 
 @router.callback_query(F.data.startswith("addmsg:"))
 async def addmsg_start(call: CallbackQuery, state: FSMContext):
+    await call.answer()
     bot_db_id = int(call.data.split(":")[1])
     await state.set_state(AddMessageState.text)
     await state.update_data(bot_id=bot_db_id)
     await call.message.edit_text("📝 أرسل نص الرسالة التي سيتم نشرها:", reply_markup=cancel_keyboard())
-    await call.answer()
 
 @router.message(AddMessageState.text)
 async def addmsg_text(message: Message, state: FSMContext):
@@ -664,6 +669,7 @@ async def addmsg_delay(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "saved_messages_select")
 async def saved_messages_select(call: CallbackQuery):
+    await call.answer()
     rows = await db_execute("SELECT id, username FROM bots WHERE status='active' ORDER BY id DESC", fetch=True)
     b = InlineKeyboardBuilder()
     for bot_id, username in rows:
@@ -671,10 +677,10 @@ async def saved_messages_select(call: CallbackQuery):
     b.button(text="⬅️ رجوع", callback_data="messages_menu")
     b.adjust(1)
     await call.message.edit_text("اختر البوت لعرض رسائله المجدولة:", reply_markup=b.as_markup())
-    await call.answer()
 
 @router.callback_query(F.data.startswith("savedmsg:"))
 async def saved_messages(call: CallbackQuery):
+    await call.answer()
     bot_db_id = int(call.data.split(":")[1])
     rows = await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
     b = InlineKeyboardBuilder()
@@ -689,17 +695,17 @@ async def saved_messages(call: CallbackQuery):
     b.button(text="⬅️ رجوع", callback_data="messages_menu")
     b.adjust(1)
     await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
-    await call.answer()
 
 @router.callback_query(F.data.startswith("delmsg:"))
 async def delete_message(call: CallbackQuery):
+    await call.answer("تم حذف الرسالة.")
     _, mid, bot_db_id = call.data.split(":")
     await db_execute("DELETE FROM messages WHERE id=? AND bot_id=?", (int(mid), int(bot_db_id)))
-    await call.answer("تم حذف الرسالة.")
     await saved_messages(call)
 
 @router.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
+    await call.answer()
     bots = await db_execute("SELECT COUNT(*) FROM bots", fetchone=True)
     active_chats = await db_execute("SELECT COUNT(*) FROM chats WHERE status='active'", fetchone=True)
     total_msgs = await db_execute("SELECT COUNT(*) FROM messages", fetchone=True)
@@ -715,7 +721,6 @@ async def stats(call: CallbackQuery):
     b.button(text="⬅️ رجوع", callback_data="home")
     b.adjust(1)
     await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
-    await call.answer()
 
 async def main():
     await db_init()
@@ -736,4 +741,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
