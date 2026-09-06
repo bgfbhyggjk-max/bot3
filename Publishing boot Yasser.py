@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS messages (
     bot_id INTEGER NOT NULL,
     text TEXT NOT NULL,
     delay_seconds INTEGER NOT NULL DEFAULT 60,
+    target_type TEXT NOT NULL DEFAULT 'groups',
     created_at TEXT NOT NULL,
     FOREIGN KEY(bot_id) REFERENCES bots(id) ON DELETE CASCADE
 );
@@ -79,6 +80,14 @@ async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SQL)
         await db.commit()
+
+        # إضافة عمود target_type لقاعدة البيانات في حال لم يكن موجوداً
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN target_type TEXT NOT NULL DEFAULT 'groups'")
+            await db.commit()
+        except Exception:
+            pass
+
         await db.execute(
             "INSERT OR IGNORE INTO factory_settings(key, value) VALUES('global_welcome', ?)",
             ("أهلاً بك في البوت! 👋\nنتشرف بوجودك معنا.",)
@@ -144,6 +153,7 @@ class AddBot(StatesGroup):
     owner_id = State()
 
 class SubAddPostState(StatesGroup):
+    target = State()
     text = State()
     delay = State()
 
@@ -191,10 +201,19 @@ def sub_bot_main_menu():
 
 def sub_bot_auto_publish_menu():
     b = InlineKeyboardBuilder()
-    b.button(text="➕ إنشاء منشور", callback_data="sub_create_post")
+    b.button(text="➕ إنشاء منشور جديد", callback_data="sub_select_post_target")
     b.button(text="📋 عرض المنشورات", callback_data="sub_list_posts")
     b.button(text="🔙 رجوع", callback_data="sub_main_menu")
     b.adjust(1)
+    return b.as_markup()
+
+def sub_bot_post_target_menu():
+    b = InlineKeyboardBuilder()
+    b.button(text="👥 القروبات والقنوات فقط", callback_data="sub_post_target:groups")
+    b.button(text="👤 الخاص فقط", callback_data="sub_post_target:private")
+    b.button(text="🌐 الكل (خاص + قروبات)", callback_data="sub_post_target:all")
+    b.button(text="🔙 رجوع", callback_data="sub_auto_publish")
+    b.adjust(2, 1, 1)
     return b.as_markup()
 
 def sub_bot_broadcast_target_menu():
@@ -260,14 +279,8 @@ async def send_saved_messages(bot_db_id: int):
         if not bot_row or bot_row[1] != "active":
             return
 
-        msgs = await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
+        msgs = await db_execute("SELECT id, text, delay_seconds, target_type FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
         if not msgs:
-            await asyncio.sleep(5)
-            continue
-
-        # النشر التلقائي للقروبات والقنوات فقط
-        chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active' AND chat_type IN ('group', 'supergroup', 'channel')", (bot_db_id,), fetch=True)
-        if not chats:
             await asyncio.sleep(5)
             continue
 
@@ -276,9 +289,18 @@ async def send_saved_messages(bot_db_id: int):
             bot = Bot(bot_row[0])
             bot_instances[bot_db_id] = bot
 
-        for _, text, delay in msgs:
-            for (chat_id,) in chats:
-                asyncio.create_task(safe_send_message(bot, chat_id, text))
+        for _, text, delay, target_type in msgs:
+            # تصفية المحادثات حسب خيار النشر التلقائي المخصص للمنشور
+            if target_type == "groups":
+                chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active' AND chat_type IN ('group', 'supergroup', 'channel')", (bot_db_id,), fetch=True)
+            elif target_type == "private":
+                chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active' AND chat_type='private'", (bot_db_id,), fetch=True)
+            else:
+                chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active'", (bot_db_id,), fetch=True)
+
+            if chats:
+                for (chat_id,) in chats:
+                    asyncio.create_task(safe_send_message(bot, chat_id, text))
 
             delay = max(MIN_BROADCAST_DELAY, min(int(delay), MAX_BROADCAST_DELAY))
             await asyncio.sleep(delay)
@@ -360,13 +382,26 @@ async def bot_startup(bot_db_id: int, token: str):
         text = f"🔄 <b>النشر التلقائي</b>\n\nعدد المنشورات: {count}"
         await call.message.edit_text(text, reply_markup=sub_bot_auto_publish_menu(), parse_mode="HTML")
 
-    @local_router.callback_query(F.data == "sub_create_post")
+    # اختيار مكان النشر التلقائي (عام / خاص / الكل)
+    @local_router.callback_query(F.data == "sub_select_post_target")
+    async def sub_select_post_target(call: CallbackQuery):
+        await call.answer()
+        if not await is_bot_owner(call.from_user.id):
+            return
+        text = "🎯 <b>حدد وجهة النشر التلقائي للمنشور:</b>"
+        await call.message.edit_text(text, reply_markup=sub_bot_post_target_menu(), parse_mode="HTML")
+
+    @local_router.callback_query(F.data.startswith("sub_post_target:"))
     async def sub_create_post(call: CallbackQuery, state: FSMContext):
         await call.answer()
         if not await is_bot_owner(call.from_user.id):
             return
+        target = call.data.split(":")[1]
+        await state.update_data(target=target)
         await state.set_state(SubAddPostState.text)
-        await call.message.edit_text("📝 أرسل الآن نص المنشور الذي تريد نشره تلقائياً:")
+        
+        target_str = "القروبات والقنوات" if target == "groups" else ("الخاص" if target == "private" else "الجميع (خاص + قروبات)")
+        await call.message.edit_text(f"📝 <b>الوجهة: {target_str}</b>\n\nأرسل الآن نص المنشور الذي تريد نشره تلقائياً:")
 
     @local_router.message(SubAddPostState.text)
     async def sub_save_post_text(message: Message, state: FSMContext):
@@ -387,8 +422,10 @@ async def bot_startup(bot_db_id: int, token: str):
             return
 
         data = await state.get_data()
-        await db_execute("INSERT INTO messages(bot_id, text, delay_seconds, created_at) VALUES(?,?,?,?)",
-                         (bot_db_id, data["text"], delay, await now()))
+        target = data.get("target", "groups")
+        
+        await db_execute("INSERT INTO messages(bot_id, text, delay_seconds, target_type, created_at) VALUES(?,?,?,?,?)",
+                         (bot_db_id, data["text"], delay, target, await now()))
         await state.clear()
         await message.answer("✅ تم إنشاء المنشور وجدولته بنجاح!", reply_markup=sub_bot_main_menu())
 
@@ -397,16 +434,17 @@ async def bot_startup(bot_db_id: int, token: str):
         await call.answer()
         if not await is_bot_owner(call.from_user.id):
             return
-        rows = await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
+        rows = await db_execute("SELECT id, text, delay_seconds, target_type FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
         
         b = InlineKeyboardBuilder()
         if not rows:
             text = "📋 <b>المنشورات المضافة:</b>\n\nلا توجد منشورات حالياً."
         else:
             text = "📋 <b>قائمة المنشورات المضافة:</b>\n\n"
-            for mid, mtext, mdelay in rows:
-                prev = mtext.replace('\n', ' ')[:20]
-                text += f"🆔 #{mid} | ⏱ كل {mdelay}ث | {prev}\n"
+            for mid, mtext, mdelay, mtarget in rows:
+                t_str = "عام" if mtarget == "groups" else ("خاص" if mtarget == "private" else "الكل")
+                prev = mtext.replace('\n', ' ')[:15]
+                text += f"🆔 #{mid} | 🎯 {t_str} | ⏱ كل {mdelay}ث | {prev}\n"
                 b.button(text=f"🗑 حذف المنشور #{mid}", callback_data=f"sub_delpost:{mid}")
         
         b.button(text="🔙 رجوع", callback_data="sub_auto_publish")
@@ -453,7 +491,6 @@ async def bot_startup(bot_db_id: int, token: str):
         target = data.get("target", "all")
         await state.clear()
 
-        # جلب المحادثات حسب الوجهة المحددة
         if target == "groups":
             chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active' AND chat_type IN ('group', 'supergroup', 'channel')", (bot_db_id,), fetch=True)
         elif target == "private":
