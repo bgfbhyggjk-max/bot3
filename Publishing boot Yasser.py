@@ -147,6 +147,10 @@ class SubAddPostState(StatesGroup):
     text = State()
     delay = State()
 
+class SubBroadcastState(StatesGroup):
+    target = State()
+    message = State()
+
 class AddMessageState(StatesGroup):
     bot_id = State()
     text = State()
@@ -179,18 +183,27 @@ def cancel_keyboard():
 def sub_bot_main_menu():
     b = InlineKeyboardBuilder()
     b.button(text="🔄 نشر تلقائي", callback_data="sub_auto_publish")
-    b.button(text="📢 إذاعة", callback_data="sub_broadcast")
+    b.button(text="📢 إذاعة", callback_data="sub_broadcast_menu")
     b.button(text="⚙️ الإعدادات", callback_data="sub_settings")
     b.button(text="📊 الإحصائيات", callback_data="sub_stats")
     b.adjust(2, 2)
     return b.as_markup()
 
-def sub_bot_auto_publish_menu(msg_count: int):
+def sub_bot_auto_publish_menu():
     b = InlineKeyboardBuilder()
     b.button(text="➕ إنشاء منشور", callback_data="sub_create_post")
     b.button(text="📋 عرض المنشورات", callback_data="sub_list_posts")
     b.button(text="🔙 رجوع", callback_data="sub_main_menu")
     b.adjust(1)
+    return b.as_markup()
+
+def sub_bot_broadcast_target_menu():
+    b = InlineKeyboardBuilder()
+    b.button(text="👥 القروبات فقط", callback_data="sub_bc_target:groups")
+    b.button(text="👤 الخاص فقط", callback_data="sub_bc_target:private")
+    b.button(text="🌐 الكل (قروبات + خاص)", callback_data="sub_bc_target:all")
+    b.button(text="🔙 رجوع", callback_data="sub_main_menu")
+    b.adjust(2, 1, 1)
     return b.as_markup()
 
 def bots_keyboard(rows):
@@ -252,7 +265,8 @@ async def send_saved_messages(bot_db_id: int):
             await asyncio.sleep(5)
             continue
 
-        chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active'", (bot_db_id,), fetch=True)
+        # النشر التلقائي للقروبات والقنوات فقط
+        chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active' AND chat_type IN ('group', 'supergroup', 'channel')", (bot_db_id,), fetch=True)
         if not chats:
             await asyncio.sleep(5)
             continue
@@ -328,8 +342,9 @@ async def bot_startup(bot_db_id: int, token: str):
             await call.answer("❌ لم تشترك في القناة بعد!", show_alert=True)
 
     @local_router.callback_query(F.data == "sub_main_menu")
-    async def sub_main_menu(call: CallbackQuery):
+    async def sub_main_menu(call: CallbackQuery, state: FSMContext):
         await call.answer()
+        await state.clear()
         if not await is_bot_owner(call.from_user.id):
             return
         text = "👋 <b>لوحة التحكم</b>\n\nاختر من القائمة:"
@@ -343,7 +358,7 @@ async def bot_startup(bot_db_id: int, token: str):
         msgs = await db_execute("SELECT COUNT(*) FROM messages WHERE bot_id=?", (bot_db_id,), fetchone=True)
         count = msgs[0] if msgs else 0
         text = f"🔄 <b>النشر التلقائي</b>\n\nعدد المنشورات: {count}"
-        await call.message.edit_text(text, reply_markup=sub_bot_auto_publish_menu(count), parse_mode="HTML")
+        await call.message.edit_text(text, reply_markup=sub_bot_auto_publish_menu(), parse_mode="HTML")
 
     @local_router.callback_query(F.data == "sub_create_post")
     async def sub_create_post(call: CallbackQuery, state: FSMContext):
@@ -383,16 +398,104 @@ async def bot_startup(bot_db_id: int, token: str):
         if not await is_bot_owner(call.from_user.id):
             return
         rows = await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
+        
+        b = InlineKeyboardBuilder()
         if not rows:
             text = "📋 <b>المنشورات المضافة:</b>\n\nلا توجد منشورات حالياً."
         else:
-            text = "📋 <b>قائمة المنشورات:</b>\n\n"
+            text = "📋 <b>قائمة المنشورات المضافة:</b>\n\n"
             for mid, mtext, mdelay in rows:
-                prev = mtext.replace('\n', ' ')[:25]
-                text += f"🆔 #{mid} | ⏱ كل {mdelay} ثانية | {prev}\n"
+                prev = mtext.replace('\n', ' ')[:20]
+                text += f"🆔 #{mid} | ⏱ كل {mdelay}ث | {prev}\n"
+                b.button(text=f"🗑 حذف المنشور #{mid}", callback_data=f"sub_delpost:{mid}")
         
-        b = InlineKeyboardBuilder()
         b.button(text="🔙 رجوع", callback_data="sub_auto_publish")
+        b.adjust(1)
+        await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
+
+    @local_router.callback_query(F.data.startswith("sub_delpost:"))
+    async def sub_delpost(call: CallbackQuery):
+        await call.answer("تم حذف المنشور.")
+        if not await is_bot_owner(call.from_user.id):
+            return
+        mid = int(call.data.split(":")[1])
+        await db_execute("DELETE FROM messages WHERE id=? AND bot_id=?", (mid, bot_db_id))
+        await sub_list_posts(call)
+
+    # =========================
+    # قسم الإذاعة للبوت الفرعي
+    # =========================
+    @local_router.callback_query(F.data == "sub_broadcast_menu")
+    async def sub_broadcast_menu(call: CallbackQuery):
+        await call.answer()
+        if not await is_bot_owner(call.from_user.id):
+            return
+        text = "📢 <b>قسم الإذاعة الفورية:</b>\n\nاختر أين تريد إرسال الإذاعة:"
+        await call.message.edit_text(text, reply_markup=sub_bot_broadcast_target_menu(), parse_mode="HTML")
+
+    @local_router.callback_query(F.data.startswith("sub_bc_target:"))
+    async def sub_bc_target_select(call: CallbackQuery, state: FSMContext):
+        await call.answer()
+        if not await is_bot_owner(call.from_user.id):
+            return
+        target = call.data.split(":")[1]
+        await state.update_data(target=target)
+        await state.set_state(SubBroadcastState.message)
+        
+        target_name = "القروبات فقط" if target == "groups" else ("الخاص فقط" if target == "private" else "الجميع (خاص + قروبات)")
+        await call.message.edit_text(f"📢 <b>الهدف المحدد: {target_name}</b>\n\nقم بإرسال نص الرسالة (أو إعادة توجيهها) لإذاعتها فوراً:")
+
+    @local_router.message(SubBroadcastState.message)
+    async def sub_bc_send(message: Message, state: FSMContext):
+        if not await is_bot_owner(message.from_user.id):
+            return
+        data = await state.get_data()
+        target = data.get("target", "all")
+        await state.clear()
+
+        # جلب المحادثات حسب الوجهة المحددة
+        if target == "groups":
+            chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active' AND chat_type IN ('group', 'supergroup', 'channel')", (bot_db_id,), fetch=True)
+        elif target == "private":
+            chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active' AND chat_type='private'", (bot_db_id,), fetch=True)
+        else:
+            chats = await db_execute("SELECT chat_id FROM chats WHERE bot_id=? AND status='active'", (bot_db_id,), fetch=True)
+
+        if not chats:
+            await message.answer("❌ لا توجد محادثات مسجلة في هذا القسم للإذاعة إليها.", reply_markup=sub_bot_main_menu())
+            return
+
+        sent_count = 0
+        status_msg = await message.answer("🚀 جاري بدء الإذاعة...")
+
+        for (cid,) in chats:
+            try:
+                await message.copy_to(chat_id=cid)
+                sent_count += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+
+        await status_msg.edit_text(f"✅ <b>تمت الإذاعة بنجاح!</b>\n\nإجمالي الإرسال الناجح: <code>{sent_count}</code> محادثة.", parse_mode="HTML", reply_markup=sub_bot_main_menu())
+
+    @local_router.callback_query(F.data == "sub_stats")
+    async def sub_stats(call: CallbackQuery):
+        await call.answer()
+        if not await is_bot_owner(call.from_user.id):
+            return
+        
+        groups = await db_execute("SELECT COUNT(*) FROM chats WHERE bot_id=? AND status='active' AND chat_type IN ('group', 'supergroup', 'channel')", (bot_db_id,), fetchone=True)
+        privates = await db_execute("SELECT COUNT(*) FROM chats WHERE bot_id=? AND status='active' AND chat_type='private'", (bot_db_id,), fetchone=True)
+        msgs = await db_execute("SELECT COUNT(*) FROM messages WHERE bot_id=?", (bot_db_id,), fetchone=True)
+
+        text = (
+            "📊 <b>إحصائيات البوت:</b>\n\n"
+            f"👤 عدد أعضاء الخاص: {privates[0]}\n"
+            f"👥 عدد القروبات والقنوات: {groups[0]}\n"
+            f"💬 عدد المنشورات المجدولة: {msgs[0]}\n"
+        )
+        b = InlineKeyboardBuilder()
+        b.button(text="🔙 رجوع", callback_data="sub_main_menu")
         await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
 
     @local_router.message()
