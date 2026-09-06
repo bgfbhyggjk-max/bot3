@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # =========================
 # الإعدادات
 # =========================
-FACTORY_TOKEN = "8987588644:AAFWJ7Cd62SljgXa5G5KvI18ACjQePbAA1o"
+FACTORY_TOKEN = "8276217141:AAHRxEK37ExpX2whGL6WIALNGU0kaVwiIFA"
 OWNER_ID = 342845021 
 
 DB_PATH = Path(__file__).with_name("publishing_factory.db")
@@ -78,10 +79,13 @@ async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(CREATE_SQL)
         await db.commit()
-        # إضافة ترحيب افتراضي عام إذا لم يكن موجوداً
         await db.execute(
             "INSERT OR IGNORE INTO factory_settings(key, value) VALUES('global_welcome', ?)",
             ("أهلاً بك في البوت! 👋\nنتشرف بوجودك معنا.",)
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO factory_settings(key, value) VALUES('force_channel', ?)",
+            ("",)
         )
         await db.commit()
 
@@ -106,6 +110,32 @@ async def get_global_welcome():
     row = await db_execute("SELECT value FROM factory_settings WHERE key='global_welcome'", fetchone=True)
     return row[0] if row else "أهلاً بك 👋"
 
+async def get_force_channel():
+    row = await db_execute("SELECT value FROM factory_settings WHERE key='force_channel'", fetchone=True)
+    return row[0] if row else ""
+
+async def check_subscription(bot: Bot, user_id: int) -> bool:
+    channel = await get_force_channel()
+    if not channel:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+        if member.status in ["creator", "administrator", "member"]:
+            return True
+        return False
+    except Exception as e:
+        log.warning(f"خطأ في فحص الاشتراك القناة {channel}: {e}")
+        return True
+
+# =========================
+# الحالات FSM
+# =========================
+class ForceSubState(StatesGroup):
+    channel = State()
+
+class GlobalWelcomeState(StatesGroup):
+    text = State()
+
 class AddAdmin(StatesGroup):
     user_id = State()
 
@@ -113,14 +143,18 @@ class AddBot(StatesGroup):
     token = State()
     owner_id = State()
 
-class GlobalWelcomeState(StatesGroup):
+class SubAddPostState(StatesGroup):
     text = State()
+    delay = State()
 
 class AddMessageState(StatesGroup):
     bot_id = State()
     text = State()
     delay = State()
 
+# =========================
+# لوحات التحكم
+# =========================
 async def is_admin(user_id: int) -> bool:
     if user_id == OWNER_ID:
         return True
@@ -133,13 +167,31 @@ def admin_keyboard():
     b.button(text="🤖 إضافة بوت جديد", callback_data="add_bot")
     b.button(text="🤖 البوتات المصنوعة", callback_data="list_bots")
     b.button(text="💬 الترحيب الموحد للجميع", callback_data="global_welcome_menu")
+    b.button(text="📢 الاشتراك الإجباري الموحد", callback_data="global_force_sub_menu")
     b.button(text="📤 إدارة الرسائل والنشر", callback_data="messages_menu")
     b.button(text="📊 الإحصائيات", callback_data="stats")
-    b.adjust(2, 1, 2, 1)
+    b.adjust(2, 1, 2, 1, 1)
     return b.as_markup()
 
 def cancel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")]])
+
+def sub_bot_main_menu():
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 نشر تلقائي", callback_data="sub_auto_publish")
+    b.button(text="📢 إذاعة", callback_data="sub_broadcast")
+    b.button(text="⚙️ الإعدادات", callback_data="sub_settings")
+    b.button(text="📊 الإحصائيات", callback_data="sub_stats")
+    b.adjust(2, 2)
+    return b.as_markup()
+
+def sub_bot_auto_publish_menu(msg_count: int):
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ إنشاء منشور", callback_data="sub_create_post")
+    b.button(text="📋 عرض المنشورات", callback_data="sub_list_posts")
+    b.button(text="🔙 رجوع", callback_data="sub_main_menu")
+    b.adjust(1)
+    return b.as_markup()
 
 def bots_keyboard(rows):
     b = InlineKeyboardBuilder()
@@ -209,7 +261,7 @@ async def send_saved_messages(bot_db_id: int):
                     await bot.send_message(chat_id, text)
                 except Exception as exc:
                     log.warning("فشل الإرسال للجروب %s عبر البوت %s: %s", chat_id, bot_db_id, exc)
-            
+
             delay = max(MIN_BROADCAST_DELAY, min(int(delay), MAX_BROADCAST_DELAY))
             await asyncio.sleep(delay)
 
@@ -220,6 +272,9 @@ async def start_broadcast_task(bot_db_id: int):
     task = asyncio.create_task(send_saved_messages(bot_db_id))
     running_tasks[bot_db_id] = task
 
+# =========================
+# تشغيل البوتات الفرعية المصنوعة
+# =========================
 async def bot_startup(bot_db_id: int, token: str):
     if bot_db_id in bot_instances:
         return
@@ -230,12 +285,110 @@ async def bot_startup(bot_db_id: int, token: str):
     local_router = Router()
     local_dp.include_router(local_router)
 
+    async def is_bot_owner(user_id: int) -> bool:
+        row = await db_execute("SELECT owner_id FROM bots WHERE id=?", (bot_db_id,), fetchone=True)
+        return row and row[0] == user_id
+
     @local_router.message(CommandStart())
     async def made_start(message: Message):
-        # استخدام الترحيب الموحد لجميع البوتات المصنوعة
+        await register_chat(bot_db_id, message.chat.id, message.chat.type, message.chat.title or message.chat.full_name or "")
+        
+        if await is_bot_owner(message.from_user.id):
+            text = "👋 <b>لوحة التحكم</b>\n\nاختر من القائمة:"
+            await message.answer(text, reply_markup=sub_bot_main_menu(), parse_mode="HTML")
+            return
+
+        is_subbed = await check_subscription(bot, message.from_user.id)
+        if not is_subbed:
+            channel = await get_force_channel()
+            ch_username = channel.replace("@", "")
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 اشترك في القناة أولاً", url=f"https://t.me/{ch_username}")],
+                [InlineKeyboardButton(text="✅ تحقق من الاشتراك", callback_data="check_sub")]
+            ])
+            await message.answer("⚠️ عذراً، يجب عليك الاشتراك في القناة التالية لاستخدام البوت:", reply_markup=kb)
+            return
+
         welcome = await get_global_welcome()
         await message.answer(welcome)
-        await register_chat(bot_db_id, message.chat.id, message.chat.type, message.chat.title or message.chat.full_name or "")
+
+    @local_router.callback_query(F.data == "check_sub")
+    async def check_sub_callback(call: CallbackQuery):
+        is_subbed = await check_subscription(bot, call.from_user.id)
+        if is_subbed:
+            await call.message.delete()
+            welcome = await get_global_welcome()
+            await call.message.answer(welcome)
+        else:
+            await call.answer("❌ لم تشترك في القناة بعد!", show_alert=True)
+
+    @local_router.callback_query(F.data == "sub_main_menu")
+    async def sub_main_menu(call: CallbackQuery):
+        if not await is_bot_owner(call.from_user.id):
+            return
+        text = "👋 <b>لوحة التحكم</b>\n\nاختر من القائمة:"
+        await call.message.edit_text(text, reply_markup=sub_bot_main_menu(), parse_mode="HTML")
+        await call.answer()
+
+    @local_router.callback_query(F.data == "sub_auto_publish")
+    async def sub_auto_publish(call: CallbackQuery):
+        if not await is_bot_owner(call.from_user.id):
+            return
+        msgs = await db_execute("SELECT COUNT(*) FROM messages WHERE bot_id=?", (bot_db_id,), fetchone=True)
+        count = msgs[0] if msgs else 0
+        text = f"🔄 <b>النشر التلقائي</b>\n\nعدد المنشورات: {count}"
+        await call.message.edit_text(text, reply_markup=sub_bot_auto_publish_menu(count), parse_mode="HTML")
+        await call.answer()
+
+    @local_router.callback_query(F.data == "sub_create_post")
+    async def sub_create_post(call: CallbackQuery, state: FSMContext):
+        if not await is_bot_owner(call.from_user.id):
+            return
+        await state.set_state(SubAddPostState.text)
+        await call.message.edit_text("📝 أرسل الآن نص المنشور الذي تريد نشره تلقائياً:")
+        await call.answer()
+
+    @local_router.message(SubAddPostState.text)
+    async def sub_save_post_text(message: Message, state: FSMContext):
+        if not await is_bot_owner(message.from_user.id):
+            return
+        await state.update_data(text=message.text)
+        await state.set_state(SubAddPostState.delay)
+        await message.answer("⏱ أرسل الآن الفاصل الزمني بالنشر بالثواني (مثال: 60):")
+
+    @local_router.message(SubAddPostState.delay)
+    async def sub_save_post_delay(message: Message, state: FSMContext):
+        if not await is_bot_owner(message.from_user.id):
+            return
+        try:
+            delay = int(message.text.strip())
+        except ValueError:
+            await message.answer("❌ يرجى إدخال رقم صحيح بالثواني.")
+            return
+
+        data = await state.get_data()
+        await db_execute("INSERT INTO messages(bot_id, text, delay_seconds, created_at) VALUES(?,?,?,?)",
+                         (bot_db_id, data["text"], delay, await now()))
+        await state.clear()
+        await message.answer("✅ تم إنشاء المنشور وجدولته بنجاح!", reply_markup=sub_bot_main_menu())
+
+    @local_router.callback_query(F.data == "sub_list_posts")
+    async def sub_list_posts(call: CallbackQuery):
+        if not await is_bot_owner(call.from_user.id):
+            return
+        rows = await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
+        if not rows:
+            text = "📋 <b>المنشورات المضافة:</b>\n\nلا توجد منشورات حالياً."
+        else:
+            text = "📋 <b>قائمة المنشورات:</b>\n\n"
+            for mid, mtext, mdelay in rows:
+                prev = mtext.replace('\n', ' ')[:25]
+                text += f"🆔 #{mid} | ⏱ كل {mdelay} ثانية | {prev}\n"
+        
+        b = InlineKeyboardBuilder()
+        b.button(text="🔙 رجوع", callback_data="sub_auto_publish")
+        await call.message.edit_text(text, reply_markup=b.as_markup(), parse_mode="HTML")
+        await call.answer()
 
     @local_router.message()
     async def made_message(message: Message):
@@ -258,15 +411,15 @@ async def load_all_bots():
     for bot_db_id, token in rows:
         asyncio.create_task(bot_startup(bot_db_id, token))
 
+# =========================
+# أوامر البوت الرئيسي (الصانع)
+# =========================
 @router.message(CommandStart())
 async def start(message: Message):
     welcome = await get_global_welcome()
-    
-    # إذا كان المستخدم أدمن، نرسل له الترحيب مع لوحة التحكم
     if await is_admin(message.from_user.id):
         await message.answer(f"{welcome}\n\n🏭 <b>لوحة تحكم مصنع البوتات:</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
     else:
-        # إذا كان مستخدماً عادياً في البوت الصانع، نرسل الترحيب الموحد فقط
         await message.answer(welcome)
 
 @router.callback_query(F.data == "home")
@@ -282,6 +435,67 @@ async def cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.edit_text("تم الإلغاء.", reply_markup=admin_keyboard())
     await call.answer()
+
+@router.callback_query(F.data == "global_force_sub_menu")
+async def global_force_sub_menu(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return
+    curr_chan = await get_force_channel()
+    await state.set_state(ForceSubState.channel)
+    text = (
+        "📢 <b>إدارة الاشتراك الإجباري الموحد لكل البوتات:</b>\n\n"
+        f"<b>القناة الحالية:</b> {curr_chan if curr_chan else 'لا توجد'}\n\n"
+        "✏️ أرسل معرف القناة الجديد شامل الـ @ (مثال: <code>@MyChannel</code>):\n"
+        "أو أرسل <b>إلغاء</b> لحذف الاشتراك الإجباري."
+    )
+    await call.message.edit_text(text, reply_markup=cancel_keyboard(), parse_mode="HTML")
+    await call.answer()
+
+@router.message(ForceSubState.channel)
+async def save_force_sub(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    text_input = message.text.strip()
+    if text_input in ["إلغاء", "تعطيل", "حذف"]:
+        await db_execute("INSERT OR REPLACE INTO factory_settings(key, value) VALUES('force_channel', '')")
+        await state.clear()
+        await message.answer("✅ تم تعطيل الاشتراك الإجباري بنجاح لكل البوتات!", reply_markup=admin_keyboard())
+        return
+
+    if not text_input.startswith("@"):
+        await message.answer("❌ يجب أن يبدأ معرف القناة بـ @ (مثال: @MyChannel)")
+        return
+
+    await db_execute("INSERT OR REPLACE INTO factory_settings(key, value) VALUES('force_channel', ?)", (text_input,))
+    await state.clear()
+    await message.answer(f"✅ تم حفظ القناة {text_input} كاشتراك إجباري موحد لجميع البوتات!\n⚠️ تنبيه: تأكد من رفع البوتات مشرفين بالقناة.", reply_markup=admin_keyboard())
+
+@router.callback_query(F.data == "global_welcome_menu")
+async def global_welcome_menu(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id):
+        return
+    current_welcome = await get_global_welcome()
+    await state.set_state(GlobalWelcomeState.text)
+
+    text = (
+        "💬 <b>إدارة الترحيب الموحد (لكل البوتات + البوت الصانع):</b>\n\n"
+        f"<b>الرسالة الحالية:</b>\n{current_welcome}\n\n"
+        "✏️ أرسل نص الترحيب الجديد الذي تريده أن يظهر للجميع عند الضغط على /start:"
+    )
+    await call.message.edit_text(text, reply_markup=cancel_keyboard(), parse_mode="HTML")
+    await call.answer()
+
+@router.message(GlobalWelcomeState.text)
+async def global_welcome_save(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    new_text = message.text or ""
+    await db_execute(
+        "INSERT OR REPLACE INTO factory_settings(key, value) VALUES('global_welcome', ?)",
+        (new_text,)
+    )
+    await state.clear()
+    await message.answer("✅ تم تحديث رسالة الترحيب الموحدة بنجاح لكل البوتات!", reply_markup=admin_keyboard())
 
 @router.callback_query(F.data == "add_admin")
 async def add_admin(call: CallbackQuery, state: FSMContext):
@@ -400,34 +614,6 @@ async def delete_bot(call: CallbackQuery):
     await call.answer("تم حذف البوت.")
     await list_bots(call)
 
-# إدارة الترحيب الموحد للجميع
-@router.callback_query(F.data == "global_welcome_menu")
-async def global_welcome_menu(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id):
-        return
-    current_welcome = await get_global_welcome()
-    await state.set_state(GlobalWelcomeState.text)
-    
-    text = (
-        "💬 <b>إدارة الترحيب الموحد (لكل البوتات + البوت الصانع):</b>\n\n"
-        f"<b>الرسالة الحالية:</b>\n{current_welcome}\n\n"
-        "✏️ أرسل نص الترحيب الجديد الذي تريده أن يظهر للجميع عند الضغط على /start:"
-    )
-    await call.message.edit_text(text, reply_markup=cancel_keyboard(), parse_mode="HTML")
-    await call.answer()
-
-@router.message(GlobalWelcomeState.text)
-async def global_welcome_save(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
-        return
-    new_text = message.text or ""
-    await db_execute(
-        "INSERT OR REPLACE INTO factory_settings(key, value) VALUES('global_welcome', ?)",
-        (new_text,)
-    )
-    await state.clear()
-    await message.answer("✅ تم تحديث رسالة الترحيب الموحدة بنجاح لكل البوتات!", reply_markup=admin_keyboard())
-
 @router.callback_query(F.data == "messages_menu")
 async def messages_menu(call: CallbackQuery):
     b = InlineKeyboardBuilder()
@@ -490,7 +676,7 @@ async def saved_messages_select(call: CallbackQuery):
 @router.callback_query(F.data.startswith("savedmsg:"))
 async def saved_messages(call: CallbackQuery):
     bot_db_id = int(call.data.split(":")[1])
-    rows = await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch Senator=True) if False else await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
+    rows = await db_execute("SELECT id, text, delay_seconds FROM messages WHERE bot_id=? ORDER BY id", (bot_db_id,), fetch=True)
     b = InlineKeyboardBuilder()
     text = "📋 <b>رسائل النشر المجدولة لهذا البوت:</b>\n\n"
     if not rows:
@@ -550,3 +736,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
